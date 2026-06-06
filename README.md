@@ -106,5 +106,4 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 ### Bundled helper scripts (benchmark / verification)
 | File | Purpose |
 |---|---|
-| `burn.c` | all-core CPU load generator (`gcc -O2 -o burn burn.c -lm; ./burn <nproc>`) — used to verify perf modes change real TDP |
 | `bench.sh` | samples Intel RAPL `energy_uj` to report package power/avg-freq/temp under load |
