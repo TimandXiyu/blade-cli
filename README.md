@@ -103,7 +103,3 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 | `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
 | `razerctl` | launch TUI dashboard |
 
-### Bundled helper scripts (benchmark / verification)
-| File | Purpose |
-|---|---|
-| `bench.sh` | samples Intel RAPL `energy_uj` to report package power/avg-freq/temp under load |
