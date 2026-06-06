@@ -1,0 +1,7 @@
+# build artifacts
+razerctl
+burn
+*.o
+# personal / not for publication
+PLAYBOOK.md
+*.original.md
