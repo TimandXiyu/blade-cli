@@ -78,10 +78,11 @@ razerctl rpm                              # live fan RPM, 2s interval
 razerctl mode balanced|gaming|creator     # set performance mode
 razerctl fan auto                         # return fan to firmware control
 razerctl fan 4000                         # manual RPM (clamped 2000-5300)
+razerctl fancurve                         # temp-driven auto fan (Ctrl-C restores auto)
 razerctl kbd white|red|purple|green|off   # keyboard backlight
 razerctl                                  # no args -> TUI dashboard
 ```
-TUI keys: `m` mode · `f` fan auto/manual · `+`/`-` RPM ±500 · `k` kbd colour · `p` pause monitor · `r` refresh · `q` quit.
+TUI keys: `m` mode · `f` fan auto/manual · `c` fan curve · `+`/`-` RPM ±500 · `k` kbd colour · `p` pause monitor · `r` refresh · `q` quit.
 
 > Note: the fan tachometer reading ramps slowly (~40–50 s to settle after a change).
 
@@ -136,13 +137,17 @@ Control hidraw nodes for this device: `/dev/hidraw3..6` (any that answers Get-fi
 ## razerctl command chart
 | Command | Action |
 |---|---|
-| `razerctl get` | print perf mode + fan setpoint |
+| `razerctl get` | print perf mode + fan setpoint + EPP |
+| `razerctl epp` | show CPU energy-vs-performance bias (intel_pstate HWP, raw 0-255) + preset list |
+| `razerctl epp <0-255>` | set EPP (0=max perf … 255=max power-save). **TLP resets it on the next AC↔DC switch** (`CPU_ENERGY_PERF_POLICY_ON_AC/BAT`). TUI: `e` cycles presets 0/32/…/224/255. Sudo-less via `/etc/tmpfiles.d/epp-write.conf` (0666 on `energy_performance_preference`) |
 | `razerctl rpm` | live fan RPM (2s loop) |
 | `razerctl mode <balanced\|gaming\|creator>` | set perf mode |
 | `razerctl fan auto` | hand fan back to firmware |
 | `razerctl fan <2000-5300>` | manual fan RPM |
+| `razerctl fancurve` | temp-driven auto fan: rpm follows CPU + dGPU temps via EMA-smoothed two-segment curves (flat floor → engage step → ramp to max at an alarm temp); the shared fans take the louder demand. dGPU temp is read (`nvidia-smi`) only when the GPU is already awake. `Ctrl-C` restores auto. Also a TUI toggle (`c`). Curve thresholds are `#define`s at the top of `razerctl.c`. |
 | `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
-| `sudo razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost); `off` lets the dGPU reach D3cold (~0W) on hybrid setups |
+| `razerctl powerd <on\|off\|status>` | toggle NVIDIA `nvidia-powerd` (Dynamic Boost) at runtime (start/stop); `off` lets the dGPU reach D3cold (~0W). Sudo-less via polkit `49-nvidia-powerd.rules` (wheel may start/stop that unit). Non-persistent — reboot returns to off |
+| `razerctl power <max\|save\|status>` | `max`=start powerd (boost ≤175 W) · `save`=stop powerd (ceiling resets on next D3cold) · `status`=show powerd + power limits. Sudo-less (same polkit rule) |
 | `razerctl reclaim` | restart KWin to release the dGPU after undocking (KWin auto-grabs it for an external but never frees it) → returns to D3cold. Brief screen flicker. |
 | `razerctl` | launch TUI dashboard |
 
