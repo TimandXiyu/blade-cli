@@ -12,11 +12,20 @@
 #include <unistd.h>
 #include <termios.h>
 #include <sys/select.h>
+#include <signal.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <linux/hidraw.h>
-#define L 91
+#define L 91                    // Razer HID feature-report length, in bytes
+#define DGPU_PCI "0000:01:00.0"  // NVIDIA dGPU PCI address (sysfs reads + reclaim)
 static unsigned char TID=0x1f;
+// Razer HID feature report layout (L bytes):
+//   [0]=report-id(0)  [2]=transaction-id(TID)  [6]=data-size  [7]=command-class
+//   [8]=command-id    [9..]=args               [89]=CRC (xor of bytes 3..88)
+// Command class/id pairs used below:
+//   0x0d/0x02 set power-mode/fan-enable   0x0d/0x01 set fan rpm
+//   0x0d/0x82 get power-mode   0x0d/0x81 get fan setpoint   0x0d/0x88 get fan tach
+//   0x03/0x03 kbd brightness   0x03/0x0b kbd row colors     0x03/0x0a kbd commit
 static void build(unsigned char*b,unsigned char cls,unsigned char cmd,unsigned char ds,const unsigned char*a,int n){
     memset(b,0,L); b[2]=TID; b[6]=ds; b[7]=cls; b[8]=cmd;
     for(int i=0;i<n;i++) b[9+i]=a[i];
@@ -88,7 +97,17 @@ static int kbd_color(int fd,int r,int g,int b){ // paint all 6 rows, commit, bri
     unsigned char br[3]={0x01,0x05,76}; snd(fd,0x03,0x03,0x03,br,3); // 30% = 76/255
     return 0;
 }
+// Keyboard backlight presets (index 0 = off; cycled by TUI 'k', named by CLI `kbd`).
+static const struct { const char*name; int r,g,b; } KBD[] = {
+    {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",0,255,0}
+};
+#define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
 static const char* modename(int m){return m==0?"Balanced":m==1?"Gaming":m==2?"Creator":m==4?"Custom":"?";}
+// Restart KWin so it drops the dGPU after undocking -> dGPU returns to D3cold.
+// Runs as the logged-in user (needs the Wayland session env); brief screen flicker.
+static int reclaim_dgpu(void){
+    return system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'");
+}
 // ---------- TUI ----------
 static struct termios orig;
 static void raw_on(){ tcgetattr(0,&orig); struct termios t=orig; t.c_lflag&=~(ICANON|ECHO);
@@ -110,7 +129,7 @@ static double rapl_w(const char*path,long long*prev,double*pts){
     if(e<0) return -1;
     if(*prev<0){*prev=e;*pts=t;return 0;}
     double dt=t-*pts; long long de=e-*prev;
-    if(de<0) de+=262143328850LL;            /* energy counter wrap */
+    if(de<0) de+=262143328850LL;  /* wrap = max_energy_range_uj for this RAPL domain (pkg & core share it on this CPU) */
     *prev=e;*pts=t; return dt>0?(de/1e6)/dt:0;
 }
 static int pkg_temp(void){
@@ -121,6 +140,75 @@ static int pkg_temp(void){
             for(int t=1;t<48;t++){ char lp[160]; snprintf(lp,sizeof lp,"/sys/class/hwmon/hwmon%d/temp%d_label",h,t);
                 char lab[40]; rds(lp,lab,sizeof lab); if(strstr(lab,"Package")){ snprintf(path,sizeof path,"/sys/class/hwmon/hwmon%d/temp%d_input",h,t); break; } } } }
     if(!path[0])return -1; long long v=rdll(path); return v<0?-1:(int)(v/1000);
+}
+// ---------- custom fan curve (temp -> rpm, EMA-smoothed) ----------
+// Fan speed is driven purely by CPU package temp + dGPU temp. Each maps through a linear
+// ramp from a floor temp (pre-ramp -> FAN_RPM_ENGAGE) to its ALARM temp (-> FAN_RPM_MAX); the (shared)
+// fans take the LOUDER of the two demands. Temps are EMA-smoothed asymmetrically (ramp up
+// fast, spin down slow) to track load without hunting. At/above an alarm temp the RAW
+// (unsmoothed) reading forces full speed at once -- safety is never smoothed.
+#define FAN_RPM_IDLE   2200   // flat idle rpm below the pre-ramp (2026-06-10, ex 2000/2500)
+#define FAN_RPM_ENGAGE 2500   // rpm reached at the main floor temp (T_LO)
+#define FAN_RPM_MAX    5300
+#define PRE_T_BAND     10     // pre-ramp width: (T_LO-10)..T_LO eases IDLE->ENGAGE
+                              // (+30 rpm/C -- inaudible by design; CPU 55-65C, GPU 60-70C)
+#define CPU_T_LO 65      // CPU: fan floor / engage temp (C) -- flat 2500 below
+#define CPU_T_HI 90      // CPU: ALARM -> full speed (C)
+#define GPU_T_LO 70      // GPU: fan floor / engage temp (C) -- flat 2500 below
+#define GPU_T_HI 82      // GPU: ALARM -> full speed (C)
+#define EMA_UP   0.50    // smoothing weight when a temp is RISING  (responsive)
+#define EMA_DOWN 0.25    // smoothing weight when a temp is FALLING (spin-down speed)
+#define FAN_STEP 150     // min rpm change before issuing a new HID write (hysteresis)
+#define FAN_LOOP_S 2     // poll interval (s)
+static int dgpu_awake(void){ char s[16]; rds("/sys/bus/pci/devices/" DGPU_PCI "/power_state",s,sizeof s); return !strcmp(s,"D0"); }
+// dGPU temp in C, or -1 if the dGPU is asleep/unreadable. Only shells out to nvidia-smi when
+// the GPU is ALREADY D0 -- an idle dGPU stays in D3cold and we must never wake it just to poll.
+static int gpu_temp(void){
+    if(!dgpu_awake()) return -1;
+    FILE*f=popen("/usr/bin/nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null","r");
+    if(!f) return -1; int t=-1; if(fscanf(f,"%d",&t)!=1) t=-1; pclose(f); return t;
+}
+// Three segments: flat FAN_RPM_IDLE below (lo-PRE_T_BAND); a gentle pre-ramp
+// IDLE->ENGAGE across (lo-PRE_T_BAND)..lo; then the main ramp ENGAGE->MAX at the
+// alarm temp. The pre-ramp keeps the idle->engage transition inaudible.
+static int curve_rpm(double t,double lo,double hi){
+    if(t<=lo-PRE_T_BAND) return FAN_RPM_IDLE;
+    if(t<lo) return FAN_RPM_IDLE +
+        (int)((FAN_RPM_ENGAGE-FAN_RPM_IDLE)*(t-(lo-PRE_T_BAND))/PRE_T_BAND+0.5);
+    if(t>=hi) return FAN_RPM_MAX;
+    return FAN_RPM_ENGAGE + (int)((FAN_RPM_MAX-FAN_RPM_ENGAGE)*(t-lo)/(hi-lo)+0.5);
+}
+// One curve tick: read CPU+dGPU temps, advance the two EMA states (*ec/*eg, asymmetric: fast up,
+// slow down), and return the target rpm (the LOUDER of the CPU/GPU demands; alarm forces FAN_RPM_MAX).
+// Outputs the raw temps (*ctp/*gtp; gt=-1 if the dGPU is asleep) and whether an alarm tripped (*alm).
+// Shared by the CLI `fancurve` loop and the TUI 'c' toggle so the two can never drift apart.
+static int curve_step(double*ec,double*eg,int*ctp,int*gtp,int*alm){
+    int ct=pkg_temp(), gt=gpu_temp(); *ctp=ct; *gtp=gt;
+    if(ct>=0){ if(*ec<0)*ec=ct; else *ec += ((ct>*ec)?EMA_UP:EMA_DOWN)*(ct-*ec); }
+    if(gt>=0){ if(*eg<0)*eg=gt; else *eg += ((gt>*eg)?EMA_UP:EMA_DOWN)*(gt-*eg); } else *eg=-1;
+    *alm=(ct>=CPU_T_HI)||(gt>=GPU_T_HI);             // raw temps; gt=-1 (asleep) can't trip it
+    int rc=(*ec>=0)?curve_rpm(*ec,CPU_T_LO,CPU_T_HI):FAN_RPM_IDLE;
+    int rg=(*eg>=0)?curve_rpm(*eg,GPU_T_LO,GPU_T_HI):FAN_RPM_IDLE;
+    int t=rc>rg?rc:rg; if(*alm)t=FAN_RPM_MAX; return (t/100)*100;
+}
+static volatile sig_atomic_t curve_stop=0;
+static void curve_sigint(int s){ (void)s; curve_stop=1; }
+// Standalone foreground curve loop (CLI `fancurve`); the TUI 'c' toggle reuses curve_step() directly.
+static int fan_curve(int fd){
+    signal(SIGINT,curve_sigint);
+    printf("fan curve: CPU %d->%dC  GPU %d->%dC  =>  %d-%d rpm   (EMA up=%.2f down=%.2f)\n",
+           CPU_T_LO,CPU_T_HI,GPU_T_LO,GPU_T_HI,FAN_RPM_IDLE,FAN_RPM_MAX,EMA_UP,EMA_DOWN);
+    printf("alarm = full speed at CPU>=%dC or GPU>=%dC. Ctrl-C to stop (fans return to AUTO).\n",CPU_T_HI,GPU_T_HI);
+    double ec=-1,eg=-1; int applied=-1;
+    while(!curve_stop){
+        int ct,gt,alarm; int target=curve_step(&ec,&eg,&ct,&gt,&alarm);
+        if(applied<0||alarm||abs(target-applied)>=FAN_STEP){ if(set_fan(fd,target)==0) applied=target; }
+        char gb[24]; if(gt>=0)snprintf(gb,sizeof gb,"%3dC(ema%5.1f)",gt,eg); else snprintf(gb,sizeof gb,"asleep       ");
+        printf("\rCPU %3dC(ema%5.1f)  GPU %s  -> %4d rpm %s ",ct,ec,gb,applied,alarm?"[ALARM]":"       ");
+        fflush(stdout);
+        for(int i=0;i<FAN_LOOP_S*10 && !curve_stop;i++) usleep(100000);   // sleep, stay Ctrl-C responsive
+    }
+    printf("\nrestoring fan to AUTO...\n"); set_fan_auto(fd); return 0;
 }
 static double cpu_busy(void){ static long long pt=-1,pi=-1;
     FILE*f=fopen("/proc/stat","r"); if(!f)return -1; char c[8]; long long u,n,sy,idle,io,ir,si,st;
@@ -134,64 +222,125 @@ static double deep_res(int ncpu){ static long long pv=-1; static double pts=-1;
     double t=mono(); if(pv<0){pv=sum;pts=t;return 0;} double dt=t-pts; long long d=sum-pv; pv=sum;pts=t;
     return dt>0?100.0*(d/1e6)/(dt*ncpu):0;
 }
-static void draw(const char*node,int pm,int manual,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int mon,const char*kbd,const char*msg){
+// Live CPU frequency: mean across all online cores + the single peak core (scaling_cur_freq, kHz->MHz).
+static void cpu_freq(int ncpu,int*mean,int*max){
+    long sum=0,mx=0; int cnt=0;
+    for(int i=0;i<ncpu;i++){ char p[128]; snprintf(p,sizeof p,"/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",i);
+        long f=rdl(p); if(f<=0) continue; sum+=f; if(f>mx)mx=f; cnt++; }
+    *mean = cnt ? (int)(sum/cnt/1000) : -1;
+    *max  = mx  ? (int)(mx/1000)     : -1;
+}
+// ---- EPP (CPU energy-vs-performance bias; intel_pstate HWP, raw 0-255: 0=max perf, 255=max powersave) ----
+// sysfs echoes named tiers for the round values; map those back to the raw number.
+#define EPP_PATH0 "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+static const int EPP_PRESET[]={0,32,64,96,128,160,192,224,255};   // knobs: 0..255 step 32 (+255 cap)
+#define NEPP ((int)(sizeof EPP_PRESET / sizeof EPP_PRESET[0]))
+static int epp_named(const char*s){ // standard intel_pstate tier name -> raw value, else -1
+    if(!strcmp(s,"performance"))return 0;        if(!strcmp(s,"balance_performance"))return 128;
+    if(!strcmp(s,"balance_power"))return 192;     if(!strcmp(s,"power"))return 255;     return -1; }
+static int get_epp(char*name,int n){ // returns raw 0-255 (best effort); name <- sysfs string
+    char s[24]; rds(EPP_PATH0,s,sizeof s); if(name) snprintf(name,n,"%s",s[0]?s:"?");
+    if(!s[0]) return -1; int k=epp_named(s); if(k>=0) return k;
+    int v=atoi(s); return (v>=0&&v<=255)?v:-1; }
+static int set_epp(int v){ // write EPP (raw 0-255) to every cpu. sudo-less IF energy_performance_preference
+    if(v<0)v=0; if(v>255)v=255;  // is world-writable (see /etc/tmpfiles.d/epp-write.conf); 0=ok, -1=no write
+    int n=(int)sysconf(_SC_NPROCESSORS_ONLN), ok=-1;
+    for(int i=0;i<n;i++){ char p[128]; snprintf(p,sizeof p,"/sys/devices/system/cpu/cpu%d/cpufreq/energy_performance_preference",i);
+        FILE*f=fopen(p,"w"); if(!f) continue; fprintf(f,"%d\n",v); if(fclose(f)==0) ok=0; }
+    return ok; }
+static int epp_nearest(int v){ int bi=0,bd=1<<30; for(int i=0;i<NEPP;i++){ int d=v-EPP_PRESET[i]; if(d<0)d=-d; if(d<bd){bd=d;bi=i;} } return bi; }
+static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int meanf,int maxf,int epp,const char*eppname,int mon,const char*kbd,int powerd_on,const char*msg){
     printf("\033[2J\033[H\033[1;36m  razerctl\033[0m  Blade 16 (1532:02b7) fw1.3  [%s]\n",node);
     printf("  --------------------------------------------\n");
     printf("   Perf mode : \033[1;33m%-9s\033[0m\n",modename(pm));
-    printf("   Fan       : \033[1;33m%-7s\033[0m target \033[1;33m%d rpm\033[0m (setpoint %d)\n",
-           manual?"MANUAL":"Auto", manual?rpm:0, sp);
+    printf("   Fan       : \033[1;33m%-7s\033[0m target \033[1;33m%d rpm\033[0m (setpoint %d)%s\n",
+           curve?"CURVE":(manual?"MANUAL":"Auto"), (curve||manual)?rpm:0, sp,
+           alarm?"  \033[1;31m[ALARM]\033[0m":"");
     if(mon){
     printf("   Fan RPM   : \033[1;32mfan1 %4d   fan2 %4d\033[0m  (live, lags ~50s)\n",f1,f2);
     printf("   Battery   : \033[1;33m%s  %.1f W\033[0m\n", ac?"AC":"BAT", bw);
-    { int asleep = (strcmp(gst,"suspended")==0);
-      printf("   dGPU      : %s%s (%s)\033[0m\n", asleep?"\033[1;32m":"\033[1;31m", gps, asleep?"asleep ~0W":"AWAKE drawing"); }
+    { int gone = (gst[0]==0);   // sysfs node absent = GPU removed from PCI bus (no-dGPU boot mode)
+      int asleep = gone || (strcmp(gst,"suspended")==0);
+      printf("   dGPU      : %s%s (%s)\033[0m\n", asleep?"\033[1;32m":"\033[1;31m",
+             gone?"absent":gps, gone?"removed ~0W (no-dGPU boot)":(asleep?"asleep ~0W":"AWAKE drawing")); }
+    printf("   DynBoost  : %s\033[0m  (d=toggle; needs sudo razerctl)\n", powerd_on?"\033[1;32mON  (up to 175 W)":"\033[1;31mOFF (80 W cap)");
     printf("   CPU       : \033[1;33m%dC\033[0m  pkg \033[1;33m%.1fW\033[0m  core \033[1;33m%.1fW\033[0m\n", temp, pkgw, corew);
+    if(meanf>0) printf("   CPU freq  : \033[1;33mmean %.2f GHz\033[0m   \033[1;32mpeak %.2f GHz\033[0m\n", meanf/1000.0, maxf/1000.0);
+    else        printf("   CPU freq  : \033[1;90mn/a\033[0m\n");
     printf("   C-state   : busy \033[1;33m%.0f%%\033[0m  deep(C3) \033[1;32m%.0f%%\033[0m\n", busy, deep);
     } else {
     printf("   \033[1;90m-- monitoring PAUSED (no polling) --\033[0m\n");
     }
+    if(epp>=0) printf("   CPU bias  : \033[1;33mEPP %3d\033[0m (%-19s) \033[1;90m0=perf..255=save; TLP resets on AC/DC\033[0m\n", epp, eppname);
+    else       printf("   CPU bias  : \033[1;90mEPP n/a (no intel_pstate HWP)\033[0m\n");
     printf("   Kbd light : \033[1;33m%s\033[0m  (30%% when on)\n", kbd);
     printf("  --------------------------------------------\n");
-    printf("   m: mode  f: fan  +/-: rpm  k: kbd color  w: reclaim dGPU  p: pause mon  r: refresh  q: quit\n");
+    printf("   m: mode  f: fan  c: curve  +/-: rpm  k: kbd color  e: EPP step  d: boost  w: reclaim  p: pause  r: refresh  q: quit\n");
     if(msg&&*msg) printf("\n   \033[32m%s\033[0m\n",msg);
     fflush(stdout);
 }
+// "on" = nvidia-powerd ACTIVE this boot. We toggle via start/stop (runtime, polkit-scoped to the unit),
+// NOT enable/disable, so it's intentionally non-persistent: a reboot returns to powerd OFF (D3cold default).
+static int powerd_enabled(void){ return system("/usr/bin/systemctl is-active --quiet nvidia-powerd 2>/dev/null")==0; }
 static int tui(int fd,const char*node){
     int manual=0,rpm=4000; char msg[160]="";
+    int curve=0,alarm=0,capplied=-1; double ec=-1,eg=-1;   // temp-curve toggle: EMA temps + last-applied rpm
     int pm=get_pmode(fd), sp=get_fan_setpoint(fd); manual = sp>0; if(manual) rpm=sp;
     long long pe=-1,ce=-1; double pts=0,cts=0; int ncpu=(int)sysconf(_SC_NPROCESSORS_ONLN); int mon=1;
-    const char*kbdn[]={"off","white","red","purple","green"}; int kbi=0;
+    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0));
     raw_on();
     for(;;){
-        int f1=-1,f2=-1,temp=-1,ac=-1; double bw=0,pkgw=-1,corew=-1,busy=-1,deep=-1;
+        int f1=-1,f2=-1,temp=-1,ac=-1,meanf=-1,maxf=-1; double bw=0,pkgw=-1,corew=-1,busy=-1,deep=-1;
         char gst[32]="?",gps[16]="?";
         if(mon){
             f1=get_tach(fd,1); f2=get_tach(fd,2);
             bw=batt_watts(&ac);
-            rds("/sys/bus/pci/devices/0000:01:00.0/power/runtime_status",gst,sizeof gst);
-            rds("/sys/bus/pci/devices/0000:01:00.0/power/../power_state",gps,sizeof gps);
+            rds("/sys/bus/pci/devices/" DGPU_PCI "/power/runtime_status",gst,sizeof gst);
+            rds("/sys/bus/pci/devices/" DGPU_PCI "/power/../power_state",gps,sizeof gps);
             pkgw=rapl_w("/sys/class/powercap/intel-rapl:0/energy_uj",&pe,&pts);
             corew=rapl_w("/sys/class/powercap/intel-rapl:0:0/energy_uj",&ce,&cts);
             temp=pkg_temp(); busy=cpu_busy(); deep=deep_res(ncpu);
+            cpu_freq(ncpu,&meanf,&maxf);
+            powerd_on=powerd_enabled();
         }
-        draw(node,pm,manual,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,mon,kbdn[kbi],msg);
+        if(curve){   // temp-driven: advance the EMA curve and apply with hysteresis (capplied = last write)
+            int ct,gt; rpm=curve_step(&ec,&eg,&ct,&gt,&alarm); (void)ct;(void)gt;
+            if(capplied<0||alarm||abs(rpm-capplied)>=FAN_STEP){ if(set_fan(fd,rpm)==0) capplied=rpm; }
+        } else alarm=0;
+        char eppname[24]; int epp=get_epp(eppname,sizeof eppname);
+        draw(node,pm,manual,curve,alarm,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,meanf,maxf,epp,eppname,mon,KBD[kbi].name,powerd_on,msg);
         fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={2,0};
-        if(select(1,&r,0,0, mon?&tv:NULL)<=0) continue;  // paused: block until key (no polling)
+        if(select(1,&r,0,0, (mon||curve)?&tv:NULL)<=0) continue;  // paused & no curve: block until key
         msg[0]=0; int ch=getchar();
-        if(ch=='q') break;
-        else if(ch=='r'){ pm=get_pmode(fd); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"refreshed"); }
+        if(ch=='q'){ if(curve) set_fan_auto(fd); break; }   // curve owns the fan -> hand back to AUTO on exit
+        else if(ch=='r'){ pm=get_pmode(fd); sp=get_fan_setpoint(fd); powerd_on=powerd_enabled(); snprintf(msg,sizeof msg,"refreshed"); }
         else if(ch=='p'){ mon=!mon; pe=ce=-1; snprintf(msg,sizeof msg, mon?"monitor ON":"monitor PAUSED"); }
-        else if(ch=='w'){ system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'"); snprintf(msg,sizeof msg,"KWin restarted (reclaim dGPU)"); }
-        else if(ch=='k'){ kbi=(kbi+1)%5;
-            if(kbi==0) kbd_off(fd);
-            else { int r=0,g=0,b=0; if(kbi==1){r=g=b=255;} else if(kbi==2){r=255;} else if(kbi==3){r=128;b=128;} else {g=255;} kbd_color(fd,r,g,b); }
-            snprintf(msg,sizeof msg,"kbd -> %s",kbdn[kbi]); }
+        else if(ch=='w'){ reclaim_dgpu(); snprintf(msg,sizeof msg,"KWin restarted (reclaim dGPU)"); }
+        else if(ch=='d'){
+            // toggle Dynamic Boost (nvidia-powerd); sudo-less via polkit (49-nvidia-powerd.rules)
+            int r=system(powerd_on
+                ? "/usr/bin/systemctl stop nvidia-powerd 2>/dev/null"
+                : "/usr/bin/systemctl start nvidia-powerd 2>/dev/null");
+            powerd_on=powerd_enabled();
+            if(r!=0) snprintf(msg,sizeof msg,"boost toggle failed (polkit rule missing?)");
+            else snprintf(msg,sizeof msg,"DynBoost -> %s",powerd_on?"ON (up to 175 W)":"OFF (80 W cap)");
+        }
+        else if(ch=='k'){ kbi=(kbi+1)%NKBD;
+            if(KBD[kbi].r<0) kbd_off(fd); else kbd_color(fd,KBD[kbi].r,KBD[kbi].g,KBD[kbi].b);
+            snprintf(msg,sizeof msg,"kbd -> %s",KBD[kbi].name); }
+        else if(ch=='e'){ eppi=(eppi+1)%NEPP; int v=EPP_PRESET[eppi];
+            if(set_epp(v)==0) snprintf(msg,sizeof msg,"EPP -> %d  (TLP resets it on the next AC/DC switch)",v);
+            else snprintf(msg,sizeof msg,"EPP needs sudo: run as  sudo razerctl"); }
         else if(ch=='m'){ int w=(pm==0?1:pm==1?2:0); set_pmode(fd,w); pm=get_pmode(fd);
             snprintf(msg,sizeof msg, pm==w?"mode -> %s":"mode FAILED (%s)", modename(pm)); }
-        else if(ch=='f'){ if(manual){ manual=0; set_fan_auto(fd); snprintf(msg,sizeof msg,"fan AUTO"); }
+        else if(ch=='f'){ if(curve){curve=0;alarm=0;}   // leaving curve -> fall through to manual at the last target
+            if(manual){ manual=0; set_fan_auto(fd); snprintf(msg,sizeof msg,"fan AUTO"); }
             else { manual=1; set_fan(fd,rpm); snprintf(msg,sizeof msg,"fan MANUAL %d",rpm); } sp=get_fan_setpoint(fd); }
+        else if(ch=='c'){ curve=!curve;   // toggle the temp-driven curve
+            if(curve){ manual=0; ec=eg=-1; capplied=-1; snprintf(msg,sizeof msg,"fan CURVE on (CPU %d->%dC  GPU %d->%dC; f or q restores AUTO)",CPU_T_LO,CPU_T_HI,GPU_T_LO,GPU_T_HI); }
+            else { set_fan_auto(fd); sp=get_fan_setpoint(fd); alarm=0; snprintf(msg,sizeof msg,"fan CURVE off -> AUTO"); } }
         else if(ch=='+'||ch=='='){ if(manual){ rpm+=500; if(rpm>5300)rpm=5300; set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm);} }
-        else if(ch=='-'||ch=='_'){ if(manual){ rpm-=500; if(rpm<2000)rpm=2000; set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm);} }
+        else if(ch=='-'||ch=='_'){ if(manual){ rpm-=500; if(rpm<2500)rpm=2500; set_fan(fd,rpm); sp=get_fan_setpoint(fd); snprintf(msg,sizeof msg,"rpm %d",rpm);} }
     }
     raw_off(); return 0;
 }
@@ -200,20 +349,30 @@ int main(int argc,char**argv){
     if(fd<0){ fprintf(stderr,"razerctl: no responding 1532:02b7 hidraw (root? udev rule?)\n"); return 2; }
     if(argc==1) return tui(fd,node);
     if(!strcmp(argv[1],"get")){
-        printf("node=%s perf=%s fan-setpoint=%d rpm (0=auto)\n",node,modename(get_pmode(fd)),get_fan_setpoint(fd));
+        char en[24]; int ev=get_epp(en,sizeof en);
+        printf("node=%s perf=%s fan-setpoint=%d rpm (0=auto) epp=%d (%s)\n",node,modename(get_pmode(fd)),get_fan_setpoint(fd),ev,en);
+    } else if(!strcmp(argv[1],"epp")){
+        // CPU energy-vs-performance bias (intel_pstate HWP, raw 0-255). NOTE: TLP overrides this
+        // on every AC/DC switch via CPU_ENERGY_PERF_POLICY_ON_AC/BAT -> manual set is a live nudge.
+        char en[24]; int ev=get_epp(en,sizeof en);
+        if(argc==2){
+            printf("epp=%d (%s)   presets: 0 32 64 96 128 160 192 224 255  (0=max perf, 255=max powersave)\n",ev,en);
+            printf("note: TLP resets this on the next AC<->DC change (CPU_ENERGY_PERF_POLICY_ON_AC/BAT)\n");
+        } else { int v=atoi(argv[2]); if(v<0)v=0; if(v>255)v=255;
+            int r=set_epp(v); char en2[24]; int nv=get_epp(en2,sizeof en2);
+            printf("%s epp -> %d (now %d / %s); TLP will reset it on the next AC/DC switch\n", r==0?"ok":"FAILED", v, nv, en2);
+            if(r!=0) fprintf(stderr,"  (energy_performance_preference not writable; is /etc/tmpfiles.d/epp-write.conf applied?)\n");
+        }
     } else if(!strcmp(argv[1],"fan")&&argc==3){
         if(!strcmp(argv[2],"auto")) printf("%s\n",set_fan_auto(fd)==0?"fan auto":"failed");
-        else { int r=atoi(argv[2]); if(r<2000)r=2000; if(r>5300)r=5300;
+        else { int r=atoi(argv[2]); if(r<2500)r=2500; if(r>5300)r=5300;
             int ok=set_fan(fd,r)==0; printf("%s %d (setpoint now %d)\n",ok?"fan manual":"failed",r,get_fan_setpoint(fd)); }
     } else if(!strcmp(argv[1],"kbd")&&argc==3){
-        const char*c=argv[2]; int r=0,g=0,b=0,col=1;
-        if(!strcmp(c,"off")){ printf("%s\n", kbd_off(fd)==0?"kbd off":"failed"); col=0; }
-        else if(!strcmp(c,"white")){ r=g=b=255; }
-        else if(!strcmp(c,"red")){ r=255; }
-        else if(!strcmp(c,"purple")){ r=128; b=128; }
-        else if(!strcmp(c,"green")){ g=255; }
-        else { fprintf(stderr,"kbd: white|red|purple|green|off\n"); return 1; }
-        if(col) printf("%s %s @30%%\n", kbd_color(fd,r,g,b)==0?"kbd":"failed", c);
+        const char*c=argv[2]; int i=-1;
+        for(int k=0;k<NKBD;k++) if(!strcmp(c,KBD[k].name)){ i=k; break; }
+        if(i<0){ fprintf(stderr,"kbd: white|red|purple|green|off\n"); return 1; }
+        if(KBD[i].r<0) printf("%s\n", kbd_off(fd)==0?"kbd off":"failed");
+        else printf("%s %s @30%%\n", kbd_color(fd,KBD[i].r,KBD[i].g,KBD[i].b)==0?"kbd":"failed", c);
     } else if(!strcmp(argv[1],"rpm")||!strcmp(argv[1],"watch")){
         printf("live fan rpm @2s (Ctrl-C to stop). NOTE: tach lags ~40-50s after a change.\n");
         for(;;){
@@ -229,23 +388,55 @@ int main(int argc,char**argv){
         // toggle nvidia-powerd (Dynamic Boost daemon). off => lets dGPU reach D3cold (~0W).
         const char*a=argv[2];
         if(!strcmp(a,"status")){
-            printf("nvidia-powerd: %s\n", system("systemctl is-active --quiet nvidia-powerd")==0?"active":"inactive");
-            char ps[16]="?\n"; FILE*f=fopen("/sys/bus/pci/devices/0000:01:00.0/power_state","r");
-            if(f){ if(!fgets(ps,sizeof ps,f)) ps[0]=0; fclose(f);}
+            printf("nvidia-powerd: %s\n", system("/usr/bin/systemctl is-active --quiet nvidia-powerd")==0?"active":"inactive");
+            char ps[48]="?\n"; FILE*f=fopen("/sys/bus/pci/devices/" DGPU_PCI "/power_state","r");
+            if(f){ if(!fgets(ps,sizeof ps,f)) strcpy(ps,"?\n"); fclose(f);}
+            else strcpy(ps,"removed (no-dGPU boot mode)\n");
             printf("dGPU power_state: %s", ps);
         } else if(!strcmp(a,"off")||!strcmp(a,"on")){
-            if(geteuid()!=0){ fprintf(stderr,"powerd %s needs root: sudo razerctl powerd %s\n",a,a); return 1; }
-            int r=system(!strcmp(a,"off") ? "systemctl disable --now nvidia-powerd" : "systemctl enable --now nvidia-powerd");
-            printf("nvidia-powerd %s -> %s\n", a, r==0?"ok":"failed");
+            // sudo-less via polkit (49-nvidia-powerd.rules); absolute path = don't trust inherited $PATH
+            int r=system(!strcmp(a,"off") ? "/usr/bin/systemctl stop nvidia-powerd" : "/usr/bin/systemctl start nvidia-powerd");
+            printf("nvidia-powerd %s -> %s\n", a, r==0?"ok":"failed (polkit rule missing?)");
         } else { fprintf(stderr,"powerd: on|off|status\n"); return 1; }
+        } else if(!strcmp(argv[1],"fancurve")||!strcmp(argv[1],"autofan")){
+        // temp-driven fan loop: CPU + dGPU temp -> rpm via EMA-smoothed curves; Ctrl-C restores AUTO.
+        return fan_curve(fd);
     } else if(!strcmp(argv[1],"reclaim")){
-        // restart KWin so it releases the dGPU after undocking -> dGPU returns to D3cold.
-        // run as the logged-in user (inherits Wayland session env); brief screen flicker.
         printf("restarting KWin (brief flicker) to release the dGPU...\n");
-        int r=system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'");
+        int r=reclaim_dgpu();
         printf("%s\n", r==0?"kwin --replace launched":"failed");
+    } else if(!strcmp(argv[1],"power")&&argc==3){
+        // max: enable nvidia-powerd (Dynamic Boost) + raise TDP to card max.
+        // save: disable powerd + reset TDP to driver default.
+        // status: report powerd state + current/max/default power limits.
+        const char*a=argv[2];
+        if(!strcmp(a,"status")){
+            printf("nvidia-powerd: %s\n", system("/usr/bin/systemctl is-active --quiet nvidia-powerd")==0?"active (Dynamic Boost ON)":"inactive");
+            // GPU Ceiling Power Limit (current), max, and default via -q -d POWER
+            FILE*f=popen("/usr/bin/nvidia-smi -q -d POWER 2>/dev/null","r");
+            if(f){ char line[128];
+                while(fgets(line,sizeof line,f)){
+                    if(strstr(line," N/A")) continue; // skip unset base-power fields
+                    if(strstr(line,"Current Power Limit")||strstr(line,"Max Power Limit")||strstr(line,"Default Power Limit")||strstr(line,"Average Power Draw"))
+                        printf(" %s",line);
+                } pclose(f); }
+        } else if(!strcmp(a,"max")||!strcmp(a,"save")){
+            // sudo-less via polkit (49-nvidia-powerd.rules). Both just toggle nvidia-powerd; the
+            // dGPU ceiling is owned by powerd (max=up to 175W) or the driver default (save) which
+            // re-applies on the dGPU's next D3cold sleep/wake. (No nvidia-smi -pl: needs root + flaky on laptop GPUs.)
+            int rc;
+            if(!strcmp(a,"max")){
+                rc=system("/usr/bin/systemctl start nvidia-powerd");
+                printf("power max: nvidia-powerd (Dynamic Boost) started -> %s\n",rc==0?"ok":"FAILED (polkit rule missing?)");
+                printf("  powerd boosts the dGPU ceiling up to 175 W automatically under load.\n");
+            } else {
+                rc=system("/usr/bin/systemctl stop nvidia-powerd");
+                printf("power save: nvidia-powerd stopped -> %s\n",rc==0?"ok":"FAILED (polkit rule missing?)");
+                printf("  dGPU ceiling returns to the driver default on its next D3cold sleep/wake.\n");
+            }
+        } else { fprintf(stderr,"power: max|save|status\n"); return 1; }
     } else {
-        printf("usage: razerctl [get | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | kbd <white|red|purple|green|off> | powerd <on|off|status> | reclaim]   (no args = TUI)\n");
+        printf("usage: razerctl [get | epp [0-255] | rpm | mode <balanced|gaming|creator> | fan <auto|RPM> | fancurve | kbd <white|red|purple|green|off> | powerd <on|off|status> | power <max|save|status> | reclaim]   (no args = TUI)\n");
     }
     close(fd); return 0;
 }
