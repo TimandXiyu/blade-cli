@@ -15,6 +15,8 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>           // flock (single-instance guard)
+#include <errno.h>
 #include <linux/hidraw.h>
 #define L 91                    // Razer HID feature-report length, in bytes
 #define DGPU_PCI "0000:01:00.0"  // NVIDIA dGPU PCI address (sysfs reads + reclaim)
@@ -80,21 +82,22 @@ static int set_fan_auto(int fd){
     int ok=0; ok|=snd(fd,0x0d,0x02,0x04,z1,4)!=0x02; ok|=snd(fd,0x0d,0x02,0x04,z2,4)!=0x02;
     return ok?-1:0;
 }
-static int set_pmode(int fd,int mode){ // Synapse layout (USB capture 2026-06-12): [1,zone,mode,fanflag] on BOTH zones
-    if(mode<0||mode==3||mode>4) return -1;          // 0=balanced 1=gaming 2=creator 4=custom
+static int set_pmode(int fd,int mode){ // 0=balanced 1=gaming 2=creator. EC perf-mode 0x0d/0x02 to BOTH zones.
+    if(mode<0||mode>2) return -1;                   // Custom (4) removed 2026-06-19 (unreliable, no GPU-TDP effect).
     int sp=get_fan_setpoint(fd); unsigned char flag = sp>0?1:0;
     unsigned char z1[4]={1,1,(unsigned char)mode,flag}, z2[4]={1,2,(unsigned char)mode,flag};
     int ok=0; ok|=snd(fd,0x0d,0x02,0x04,z1,4)!=0x02; ok|=snd(fd,0x0d,0x02,0x04,z2,4)!=0x02;
     if(ok) return -1;
-    return get_pmode(fd)==mode?0:-2;
+    if(get_pmode(fd)!=mode) return -2;
+    // GPU TDP on Linux is governed by Dynamic Boost (nvidia-powerd), NOT the EC perf-mode: powerd OFF caps the
+    // dGPU at its ~80W default; ON lets the driver boost to ~175W. (nvidia-smi -pl is ignored/clamped on this Ada
+    // laptop -- verified 2026-06-19.) So Creator parks the GPU at the 80W eco floor; Balanced/Gaming enable boost
+    // and the EC mode then differentiates them (~118W vs ~165W under load). sudo-less via polkit (same as 'd' key).
+    system(mode==2 ? "/usr/bin/systemctl stop nvidia-powerd 2>/dev/null"
+                   : "/usr/bin/systemctl start nvidia-powerd 2>/dev/null");
+    return 0;
 }
-// ---- Custom-mode boost + battery charge limit (opcodes from Synapse USB capture 2026-06-12) ----
-static int get_boost(int fd,int target){ // target 1=CPU 2=GPU; CPU 0..3=low/medium/high/boost, GPU 0..2
-    unsigned char b[L],in[L],a[3]={1,(unsigned char)target,0};
-    build(b,0x0d,0x87,0x03,a,3); if(xfer(fd,b,in)!=0x02) return -1; return in[11]; }
-static int set_boost(int fd,int target,int lvl){ // only meaningful in Custom mode (mode 4)
-    unsigned char a[3]={1,(unsigned char)target,(unsigned char)lvl};
-    return snd(fd,0x0d,0x07,0x03,a,3)==0x02?0:-1; }
+// ---- battery charge limit (opcode from Synapse USB capture 2026-06-12) ----
 static int get_charge_limit(int fd){ // raw byte: pct|0x80 when enabled, plain pct when disabled; <0 = error
     unsigned char b[L],in[L],a[1]={0};
     build(b,0x07,0x8f,0x01,a,1); if(xfer(fd,b,in)!=0x02) return -1; return in[9]; }
@@ -118,7 +121,7 @@ static const struct { const char*name; int r,g,b; } KBD[] = {
     {"off",-1,-1,-1}, {"white",255,255,255}, {"red",255,0,0}, {"purple",128,0,128}, {"green",0,255,0}
 };
 #define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
-static const char* modename(int m){return m==0?"Balanced":m==1?"Gaming":m==2?"Creator":m==4?"Custom":"?";}
+static const char* modename(int m){return m==0?"Balanced":m==1?"Gaming":m==2?"Creator":"?";}
 // Restart KWin so it drops the dGPU after undocking -> dGPU returns to D3cold.
 // Runs as the logged-in user (needs the Wayland session env); brief screen flicker.
 static int reclaim_dgpu(void){
@@ -165,7 +168,7 @@ static int pkg_temp(void){
 // (unsmoothed) reading forces full speed at once -- safety is never smoothed.
 #define FAN_RPM_IDLE   2200   // flat idle rpm below the pre-ramp (2026-06-10, ex 2000/2500)
 #define FAN_RPM_ENGAGE 2500   // rpm reached at the main floor temp (T_LO)
-#define FAN_RPM_MAX    4800   // Synapse's rated ceiling (USB capture 2026-06-12; was 5300, never actually reached)
+#define FAN_RPM_MAX    4800   // real ceiling: EC caps manual fan ~4700rpm; 5300 command = identical tach (tested 2026-06-14). 5100 seen was firmware-auto under load
 #define PRE_T_BAND     10     // pre-ramp width: (T_LO-10)..T_LO eases IDLE->ENGAGE
                               // (+30 rpm/C -- inaudible by design; CPU 55-65C, GPU 60-70C)
 #define CPU_T_LO 65      // CPU: fan floor / engage temp (C) -- flat 2500 below
@@ -266,16 +269,11 @@ static int set_epp(int v){ // write EPP (raw 0-255) to every cpu. sudo-less IF e
         FILE*f=fopen(p,"w"); if(!f) continue; fprintf(f,"%d\n",v); if(fclose(f)==0) ok=0; }
     return ok; }
 static int epp_nearest(int v){ int bi=0,bd=1<<30; for(int i=0;i<NEPP;i++){ int d=v-EPP_PRESET[i]; if(d<0)d=-d; if(d<bd){bd=d;bi=i;} } return bi; }
-static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int meanf,int maxf,int epp,const char*eppname,int mon,const char*kbd,int powerd_on,int cb,int gb,int btgt,const char*msg){
-    static const char*BN[4]={"low","medium","high","boost"};
+static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,int sp,int f1,int f2,double bw,int ac,const char*gst,const char*gps,int temp,double pkgw,double corew,double busy,double deep,int meanf,int maxf,int epp,const char*eppname,int mon,const char*kbd,int powerd_on,const char*msg){
     printf("\033[2J\033[H\033[1;36m  razerctl\033[0m  Blade 16 (1532:02b7) fw1.3  [%s]\n",node);
     printf("  --------------------------------------------\n");
-    if(pm==4){
-        printf("   Perf mode : \033[1;33m%-9s\033[0m  CPU \033[1;36m%-6s\033[0m  GPU \033[1;36m%-6s\033[0m\n",
-               modename(pm), (cb>=0&&cb<4)?BN[cb]:"?", (gb>=0&&gb<3)?BN[gb]:"?");
-        printf("   Boost set : editing \033[1;33m%s\033[0m  \033[1;90m1\033[0m=low \033[1;90m2\033[0m=medium \033[1;90m3\033[0m=high%s   \033[1;90m(g: CPU/GPU)\033[0m\n",
-               btgt==1?"CPU":"GPU", btgt==1?" \033[1;90m4\033[0m=boost":"");
-    } else printf("   Perf mode : \033[1;33m%-9s\033[0m\n",modename(pm));
+    printf("   Perf mode : \033[1;33m%-9s\033[0m  GPU \033[1;36m%s\033[0m\n",modename(pm),
+           pm==2?"eco ~80W":pm==1?"boost ~175W":"boost ~118W");
     printf("   Fan       : \033[1;33m%-7s\033[0m target \033[1;33m%d rpm\033[0m (setpoint %d)%s\n",
            curve?"CURVE":(manual?"MANUAL":"Auto"), (curve||manual)?rpm:0, sp,
            alarm?"  \033[1;31m[ALARM]\033[0m":"");
@@ -298,7 +296,7 @@ static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,i
     else       printf("   CPU bias  : \033[1;90mEPP n/a (no intel_pstate HWP)\033[0m\n");
     printf("   Kbd light : \033[1;33m%s\033[0m  (30%% when on)\n", kbd);
     printf("  --------------------------------------------\n");
-    printf("   m: mode  1-4/g: cpu/gpu boost (Custom)  f: fan  c: curve  +/-: rpm  k: kbd  e: EPP  d: dynboost  b: batt-limit  w: reclaim  p: pause  r/q\n");
+    printf("   m: mode (balanced/gaming/creator)  f: fan  c: curve  +/-: rpm  k: kbd  e: EPP  d: dynboost  b: batt-limit  w: reclaim  p: pause  r/q\n");
     if(msg&&*msg) printf("\n   \033[32m%s\033[0m\n",msg);
     fflush(stdout);
 }
@@ -307,10 +305,12 @@ static void draw(const char*node,int pm,int manual,int curve,int alarm,int rpm,i
 static int powerd_enabled(void){ return system("/usr/bin/systemctl is-active --quiet nvidia-powerd 2>/dev/null")==0; }
 static int tui(int fd,const char*node){
     int manual=0,rpm=4000; char msg[160]="";
-    int curve=0,alarm=0,capplied=-1; double ec=-1,eg=-1;   // temp-curve toggle: EMA temps + last-applied rpm
-    int pm=get_pmode(fd), sp=get_fan_setpoint(fd); manual = sp>0; if(manual) rpm=sp;
+    int curve=1,alarm=0,capplied=-1; double ec=-1,eg=-1;   // startup defaults: enter fan CURVE mode (curve owns the fan)
+    set_pmode(fd,0);                                        // startup default: force Balanced perf mode
+    kbd_off(fd);                                            // startup default: keyboard backlight OFF (kbi=0 below = "off")
+    int pm=get_pmode(fd), sp=get_fan_setpoint(fd);          // manual stays 0: curve drives the fan, ignore any prior setpoint
     long long pe=-1,ce=-1; double pts=0,cts=0; int ncpu=(int)sysconf(_SC_NPROCESSORS_ONLN); int mon=1;
-    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0)); int batti=0; int btgt=1;
+    int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0)); int batti=0;
     raw_on();
     for(;;){
         int f1=-1,f2=-1,temp=-1,ac=-1,meanf=-1,maxf=-1; double bw=0,pkgw=-1,corew=-1,busy=-1,deep=-1;
@@ -331,9 +331,8 @@ static int tui(int fd,const char*node){
             if(capplied<0||alarm||abs(rpm-capplied)>=FAN_STEP){ if(set_fan(fd,rpm)==0) capplied=rpm; }
         } else alarm=0;
         char eppname[24]; int epp=get_epp(eppname,sizeof eppname);
-        int cb=pm==4?get_boost(fd,1):-1, gb=pm==4?get_boost(fd,2):-1;   // boost levels only meaningful in Custom
-        draw(node,pm,manual,curve,alarm,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,meanf,maxf,epp,eppname,mon,KBD[kbi].name,powerd_on,cb,gb,btgt,msg);
-        fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={2,0};
+        draw(node,pm,manual,curve,alarm,rpm,sp,f1,f2,bw,ac,gst,gps,temp,pkgw,corew,busy,deep,meanf,maxf,epp,eppname,mon,KBD[kbi].name,powerd_on,msg);
+        fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={5,0};   // EC poll cadence: 5s (was 2s) to cut hidraw chatter
         if(select(1,&r,0,0, (mon||curve)?&tv:NULL)<=0) continue;  // paused & no curve: block until key
         msg[0]=0; int ch=getchar();
         if(ch=='q'){ if(curve) set_fan_auto(fd); break; }   // curve owns the fan -> hand back to AUTO on exit
@@ -355,10 +354,8 @@ static int tui(int fd,const char*node){
         else if(ch=='e'){ eppi=(eppi+1)%NEPP; int v=EPP_PRESET[eppi];
             if(set_epp(v)==0) snprintf(msg,sizeof msg,"EPP -> %d  (TLP resets it on the next AC/DC switch)",v);
             else snprintf(msg,sizeof msg,"EPP needs sudo: run as  sudo razerctl"); }
-        else if(ch=='m'){ int w=(pm==0?1:pm==1?2:pm==2?4:0); set_pmode(fd,w); pm=get_pmode(fd);  // cycle ...creator->custom->balanced
-            if(pm==4){ int c=get_boost(fd,1),g=get_boost(fd,2);
-                snprintf(msg,sizeof msg,"mode -> Custom (cpu boost %d, gpu boost %d; set via CLI: razerctl boost)",c,g); }
-            else snprintf(msg,sizeof msg, pm==w?"mode -> %s":"mode FAILED (%s)", modename(pm)); }
+        else if(ch=='m'){ int w=(pm==0?1:pm==1?2:0); set_pmode(fd,w); pm=get_pmode(fd); powerd_on=powerd_enabled();  // cycle balanced->gaming->creator
+            snprintf(msg,sizeof msg, pm==w?"mode -> %s (%s)":"mode FAILED (%s)", modename(pm), pm==2?"GPU eco 80W":pm==1?"GPU boost 175W":"GPU boost 118W"); }
         else if(ch=='f'){ if(curve){curve=0;alarm=0;}   // leaving curve -> fall through to manual at the last target
             if(manual){ manual=0; set_fan_auto(fd); snprintf(msg,sizeof msg,"fan AUTO"); }
             else { manual=1; set_fan(fd,rpm); snprintf(msg,sizeof msg,"fan MANUAL %d",rpm); } sp=get_fan_setpoint(fd); }
@@ -375,26 +372,40 @@ static int tui(int fd,const char*node){
             if(p) snprintf(msg,sizeof msg,"charge limit -> %d%% (wrote 0x%02x) - verify by watching charging stop near it",p,val);
             else  snprintf(msg,sizeof msg,"charge limit OFF (wrote 0x%02x)",val);
             if(r!=0) snprintf(msg,sizeof msg,"charge-limit write FAILED"); }
-        else if(ch=='g'){ btgt = btgt==1?2:1;   // switch which engine the 1-4 keys edit
-            snprintf(msg,sizeof msg,"editing %s boost (1=low 2=medium 3=high%s)",btgt==1?"CPU":"GPU",btgt==1?" 4=boost":""); }
-        else if(ch>='1'&&ch<='4'){ // set the selected engine's power sub-level directly (Custom mode only)
-            static const char*BN[4]={"low","medium","high","boost"};
-            int max = btgt==1?3:2, lvl=ch-'1';
-            if(lvl>max){ snprintf(msg,sizeof msg,"GPU has no 'boost' level (max=high); press g for CPU"); }
-            else { int r=set_boost(fd,btgt,lvl); int now=get_boost(fd,btgt);
-                if(r!=0) snprintf(msg,sizeof msg,"%s boost write FAILED",btgt==1?"CPU":"GPU");
-                else if(pm!=4) snprintf(msg,sizeof msg,"%s boost -> %s (stored; active only in Custom - press m)",btgt==1?"CPU":"GPU",BN[now]);
-                else snprintf(msg,sizeof msg,"%s boost -> %s",btgt==1?"CPU":"GPU",BN[now]); } }
     }
     raw_off(); return 0;
 }
+// Single-instance guard. Two razerctl processes doing interleaved hidraw feature-reports
+// on the same EC cross each other's responses -> corrupt readbacks / false "setter failed"
+// (e.g. an open TUI vs a CLI invocation). Take a non-blocking exclusive flock at startup;
+// the fd is intentionally kept open for the process lifetime (kernel drops the lock on exit,
+// even on crash/kill -- no stale lock). Returns 0 if we hold it (or the lock is unusable, in
+// which case we don't block the tool), -1 if another instance already holds it.
+static int single_instance(void){
+    int fd=open("/tmp/razerctl.lock",O_RDWR|O_CREAT,0666);
+    if(fd<0) return 0;                                   // can't lock -> don't block functionality
+    if(flock(fd,LOCK_EX|LOCK_NB)==0){
+        char b[16]; int n=snprintf(b,sizeof b,"%d\n",(int)getpid());
+        if(ftruncate(fd,0)==0){ ssize_t w=write(fd,b,n); (void)w; }
+        return 0;                                        // fd leaked on purpose -> lock held until exit
+    }
+    if(errno==EWOULDBLOCK||errno==EAGAIN){
+        char b[16]={0}; int other=0; if(pread(fd,b,sizeof b-1,0)>0) other=atoi(b);
+        if(other>0) fprintf(stderr,"razerctl: another instance is already running (PID %d).\n",other);
+        else        fprintf(stderr,"razerctl: another instance is already running.\n");
+        fprintf(stderr,"Refusing to start -- concurrent EC access corrupts readings. Quit the other one first.\n");
+        close(fd); return -1;
+    }
+    close(fd); return 0;                                 // unexpected flock error -> don't block
+}
 int main(int argc,char**argv){
+    if(single_instance()<0) return 3;
     char node[64]="?"; int fd=open_dev(node);
     if(fd<0){ fprintf(stderr,"razerctl: no responding 1532:02b7 hidraw (root? udev rule?)\n"); return 2; }
     if(argc==1) return tui(fd,node);
     if(!strcmp(argv[1],"get")){
         char en[24]; int ev=get_epp(en,sizeof en);
-        printf("node=%s perf=%s fan-setpoint=%d rpm (0=auto) epp=%d (%s)\n",node,modename(get_pmode(fd)),get_fan_setpoint(fd),ev,en);
+        printf("node=%s perf=%s fan-setpoint=%d rpm (0=auto) epp=%d (%s) cpu=%dC\n",node,modename(get_pmode(fd)),get_fan_setpoint(fd),ev,en,pkg_temp());
     } else if(!strcmp(argv[1],"epp")){
         // CPU energy-vs-performance bias (intel_pstate HWP, raw 0-255). NOTE: TLP overrides this
         // on every AC/DC switch via CPU_ENERGY_PERF_POLICY_ON_AC/BAT -> manual set is a live nudge.
@@ -409,7 +420,7 @@ int main(int argc,char**argv){
         }
     } else if(!strcmp(argv[1],"fan")&&argc==3){
         if(!strcmp(argv[2],"auto")) printf("%s\n",set_fan_auto(fd)==0?"fan auto":"failed");
-        else { int r=atoi(argv[2]); if(r<2000)r=2000; if(r>4800)r=4800;   // Synapse range 2000-4800
+        else { int r=atoi(argv[2]); if(r<2000)r=2000; if(r>4800)r=4800;   // Synapse range 2000-4800 (EC caps ~4700 actual; >4800 gains nothing, tested 2026-06-14)
             int ok=set_fan(fd,r)==0; printf("%s %d (setpoint now %d)\n",ok?"fan manual":"failed",r,get_fan_setpoint(fd)); }
     } else if(!strcmp(argv[1],"kbd")&&argc==3){
         const char*c=argv[2]; int i=-1;
@@ -425,29 +436,11 @@ int main(int argc,char**argv){
             fflush(stdout); sleep(2);
         }
     } else if(!strcmp(argv[1],"mode")&&argc==3){
-        int m = !strcmp(argv[2],"balanced")?0:!strcmp(argv[2],"gaming")?1:!strcmp(argv[2],"creator")?2:!strcmp(argv[2],"custom")?4:-1;
-        if(m<0){ fprintf(stderr,"mode: balanced|gaming|creator|custom\n"); return 1; }
-        int r=set_pmode(fd,m); printf("%s -> %s\n", r==0?"ok":"FAILED", modename(get_pmode(fd)));
-        if(m==4&&r==0) printf("  custom mode active: set sub-levels with  razerctl boost cpu|gpu <level>\n");
-    } else if(!strcmp(argv[1],"boost")){
-        // CPU/GPU power sub-levels, Custom mode only. CPU: 0=low 1=medium 2=high 3=boost; GPU: 0=low 1=medium 2=high.
-        static const char*BN[4]={"low","medium","high","boost"};
-        if(argc==2){
-            int c=get_boost(fd,1), g=get_boost(fd,2), pm=get_pmode(fd);
-            printf("cpu boost: %d (%s)   gpu boost: %d (%s)   [perf mode: %s]\n",
-                   c, (c>=0&&c<4)?BN[c]:"?", g, (g>=0&&g<3)?BN[g]:"?", modename(pm));
-            if(pm!=4) printf("note: boost levels only take effect in Custom mode (razerctl mode custom)\n");
-        } else if(argc==4){
-            int tgt = !strcmp(argv[2],"cpu")?1:!strcmp(argv[2],"gpu")?2:-1;
-            if(tgt<0){ fprintf(stderr,"boost: cpu|gpu <low|medium|high|boost|0-3>\n"); return 1; }
-            int max = tgt==1?3:2, lvl=-1;
-            for(int k=0;k<=max;k++) if(!strcmp(argv[3],BN[k])) lvl=k;
-            if(lvl<0&&argv[3][0]>='0'&&argv[3][0]<='9') lvl=atoi(argv[3]);
-            if(lvl<0||lvl>max){ fprintf(stderr,"boost %s: low|medium|high%s (0-%d)\n",argv[2],tgt==1?"|boost":"",max); return 1; }
-            if(get_pmode(fd)!=4) printf("note: not in Custom mode - value is stored but only applies in Custom\n");
-            int r=set_boost(fd,tgt,lvl); int now=get_boost(fd,tgt);
-            printf("%s %s boost -> %d (%s), readback %d\n", r==0?"ok":"FAILED", argv[2], lvl, BN[lvl], now);
-        } else { fprintf(stderr,"boost            (show)\nboost cpu|gpu <low|medium|high|boost|0-3>\n"); return 1; }
+        int m = !strcmp(argv[2],"balanced")?0:!strcmp(argv[2],"gaming")?1:!strcmp(argv[2],"creator")?2:-1;
+        if(m<0){ fprintf(stderr,"mode: balanced|gaming|creator\n"); return 1; }
+        int r=set_pmode(fd,m);
+        printf("%s -> %s  (GPU %s)\n", r==0?"ok":"FAILED", modename(get_pmode(fd)),
+               m==2?"eco ~80W, Dynamic Boost OFF":m==1?"boost up to ~175W":"boost ~118W");
     } else if(!strcmp(argv[1],"battery")){
         // EC battery charge limit. SETTER opcode is well-attested from the Synapse capture
         // (0x07/0x12 arg = pct|0x80; 60->bc 65->c1 80->d0 off->41), BUT the readback (0x07/0x8f)
@@ -518,7 +511,7 @@ int main(int argc,char**argv){
             }
         } else { fprintf(stderr,"power: max|save|status\n"); return 1; }
     } else {
-        printf("usage: razerctl [get | epp [0-255] | rpm | mode <balanced|gaming|creator|custom> | boost [cpu|gpu <level>] | battery [status|<50-100>|off] | fan <auto|RPM> | fancurve | kbd <white|red|purple|green|off> | powerd <on|off|status> | power <max|save|status> | reclaim]   (no args = TUI)\n");
+        printf("usage: razerctl [get | epp [0-255] | rpm | mode <balanced|gaming|creator> | battery [status|<50-100>|off] | fan <auto|RPM> | fancurve | kbd <white|red|purple|green|off> | powerd <on|off|status> | power <max|save|status> | reclaim]   (no args = TUI)\n");
     }
     close(fd); return 0;
 }
