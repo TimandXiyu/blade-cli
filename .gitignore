@@ -2,6 +2,7 @@
 razerctl
 burn
 *.o
+build/
 # personal / not for publication
 PLAYBOOK.md
 *.original.md

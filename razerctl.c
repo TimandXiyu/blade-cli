@@ -170,11 +170,9 @@ static const struct { const char*name; int r,g,b; } KBD[] = {
 };
 #define NKBD ((int)(sizeof KBD / sizeof KBD[0]))
 static const char* modename(int m){return m==0?"Balanced":m==1?"Gaming":m==2?"Creator":"?";}
-// Restart KWin so it drops the dGPU after undocking -> dGPU returns to D3cold.
-// Runs as the logged-in user (needs the Wayland session env); brief screen flicker.
-static int reclaim_dgpu(void){
-    return system("setsid sh -c 'KWIN_DRM_DEVICES=/dev/dri/igpu kwin_wayland --replace >/dev/null 2>&1 &'");
-}
+// (Removed: reclaim_dgpu / KWin restart. We now reboot into an iGPU-only BIOS
+// state to park the dGPU, so restarting the compositor to "drop" the dGPU made
+// no sense in dGPU-only MUX mode -- deprecated 2026-06-21.)
 // ---------- TUI ----------
 static struct termios orig;
 static char obuf[1<<15];
@@ -531,7 +529,7 @@ static int readkey(void){
     return c;
 }
 #define ROWC(y,is,...) do{ printf("  %s ",(is)?"\033[1;36m▶":" "); printf(__VA_ARGS__); printf("\033[0m\033[K\n"); }while(0)
-#define MROWS 10
+#define MROWS 9
 #define DROWS 6
 
 static int tui(int fd,const char*node){
@@ -595,7 +593,6 @@ static int tui(int fd,const char*node){
             printf("  - - - - - - - - - - - - - - - - - - - - - - \n");
             ROWC(7,sel==7,"Monitoring: %s\033[0m",mon?"\033[1;32mON":"\033[1;90mpaused");
             ROWC(8,sel==8,"\033[1;36mdGPU undervolt ▸\033[0m  \033[1;90mEnter to open\033[0m");
-            ROWC(9,sel==9,"Reclaim dGPU      \033[1;90mEnter: restart KWin\033[0m");
             printf("  --------------------------------------------\n");
             printf("   \033[1;90m↑↓ move   ←→ change   Enter open/toggle   q quit\033[0m\n");
         } else {
@@ -653,7 +650,6 @@ static int tui(int fd,const char*node){
             else if(k==K_ENTER){
                 if(sel==7){ mon=!mon; pe=ce=-1; last_poll=-1; snprintf(msg,sizeof msg,mon?"monitoring ON":"monitoring paused"); }
                 else if(sel==8){ page=1; dsel=0; }
-                else if(sel==9){ reclaim_dgpu(); snprintf(msg,sizeof msg,"KWin restarted (reclaim dGPU)"); }
             }
             else if(k==K_LEFT||k==K_RIGHT){
                 int dir=(k==K_RIGHT)?1:-1;
@@ -852,10 +848,6 @@ int main(int argc,char**argv){
         } else if(!strcmp(argv[1],"fancurve")||!strcmp(argv[1],"autofan")){
         // temp-driven fan loop: CPU + dGPU temp -> rpm via EMA-smoothed curves; Ctrl-C restores AUTO.
         return fan_curve(fd);
-    } else if(!strcmp(argv[1],"reclaim")){
-        printf("restarting KWin (brief flicker) to release the dGPU...\n");
-        int r=reclaim_dgpu();
-        printf("%s\n", r==0?"kwin --replace launched":"failed");
     } else if(!strcmp(argv[1],"power")&&argc==3){
         // max: enable nvidia-powerd (Dynamic Boost) + raise TDP to card max.
         // save: disable powerd + reset TDP to driver default.
@@ -887,7 +879,7 @@ int main(int argc,char**argv){
             }
         } else { fprintf(stderr,"power: max|save|status\n"); return 1; }
     } else {
-        printf("usage: razerctl [get | epp [0-255] | rpm | mode <balanced|gaming|creator> | battery [status|<50-100>|off] | fan <auto|RPM> | fancurve | kbd <white|red|purple|green|off> | powerd <on|off|status> | power <max|save|status> | reclaim]   (no args = TUI)\n");
+        printf("usage: razerctl [get | epp [0-255] | rpm | mode <balanced|gaming|creator> | battery [status|<50-100>|off] | fan <auto|RPM> | fancurve | kbd <white|red|purple|green|off> | powerd <on|off|status> | power <max|save|status> | uv <mV> <min> [max] | uv reset | nvtest]   (no args = TUI)\n");
     }
     close(fd); return 0;
 }

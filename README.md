@@ -49,14 +49,23 @@ sudo apt update && sudo apt install -y git build-essential
 sudo dnf install -y git gcc make
 ```
 
-Then build and install:
+Then build and install. Two equivalent ways — pick whichever you like:
 
 ```sh
 git clone https://github.com/TimandXiyu/blade-cli.git
 cd blade-cli
+
+# Option A — plain Makefile
 make
-sudo make install      # installs to /usr/local/bin and sets up sudo-less access
+sudo make install
+
+# Option B — CMake (standard configure/build/install)
+cmake -B build
+cmake --build build
+sudo cmake --install build
 ```
+
+Both produce the same `razerctl` in `/usr/local/bin` and set up sudo-less access.
 
 Try it:
 
@@ -107,9 +116,7 @@ fan RPM, keyboard colour, CPU EPP, Dynamic Boost, and the battery charge limit.
 It also has a live readout up top (fan RPM, battery watts, dGPU state, CPU temp
 & power, CPU busy %), refreshed every few seconds so navigation stays snappy.
 
-Two rows open extra actions: **dGPU undervolt ▸** (Enter to open the undervolt
-page) and **Reclaim dGPU** (restart KWin to let an idle dGPU drop back to its
-near-0 W deep-sleep state after unplugging an external display).
+The **dGPU undervolt ▸** row opens the undervolt sub-page (press Enter).
 
 ---
 
@@ -169,7 +176,6 @@ root — re-apply it with `sudo razerctl` each session if you want it.
 | `razerctl epp [0-255]` | show or set CPU energy-vs-performance bias (0 = max perf) |
 | `razerctl powerd <on\|off\|status>` | toggle NVIDIA Dynamic Boost (`nvidia-powerd`) |
 | `razerctl power <max\|save\|status>` | `max` = boost on (≤175 W) · `save` = boost off |
-| `razerctl reclaim` | restart KWin to release an idle dGPU → back to deep sleep |
 | `razerctl uv <mV> <min> [max]` | apply a dGPU undervolt (max-freq cap needs sudo) |
 | `razerctl uv reset` | reset the dGPU to stock + clear the saved profile |
 | `razerctl nvtest` | read-only dGPU curve / voltage diagnostic |
