@@ -1,0 +1,146 @@
+.TH RAZERCTL 1 "2026-06-21" "razerctl 1.0" "User Commands"
+.SH NAME
+razerctl \- control a Razer Blade 16 (fans, performance, keyboard, dGPU undervolt) on Linux
+.SH SYNOPSIS
+.B razerctl
+.RI [ command " [" args ]]
+.PP
+With no arguments,
+.B razerctl
+launches an interactive terminal dashboard (TUI).
+.SH DESCRIPTION
+.B razerctl
+is a small, dependency-free tool that controls a Razer Blade 16 by speaking
+Razer's USB-HID vendor protocol directly over
+.IR hidraw .
+It can set the performance mode, fan speed (fixed, auto, or a temperature-driven
+curve), keyboard backlight, battery charge limit, and CPU energy bias, and it can
+undervolt the NVIDIA dGPU via a per-point voltage/frequency curve.
+.PP
+It is unofficial and reverse-engineered, developed and tested on a 2024 Razer
+Blade 16 (USB id \fB1532:02b7\fR). Opcodes can differ across models and firmware.
+.SH THE DASHBOARD
+Run
+.B razerctl
+with no arguments. Navigation is entirely by arrow keys:
+.TP
+.B Up / Down
+move between settings
+.TP
+.B Left / Right
+change the selected setting
+.TP
+.B Enter
+open a sub-page or toggle the selected item
+.TP
+.B Esc
+go back (from the dGPU undervolt page to the main page)
+.TP
+.B q
+quit
+.SH COMMANDS
+.TP
+.B get
+Print the current performance mode, fan setpoint, and EPP.
+.TP
+.BI "mode " "balanced|gaming|creator"
+Set the performance mode. On Linux the dGPU power ceiling is governed by NVIDIA
+Dynamic Boost (\fInvidia-powerd\fR): Creator parks the GPU at its ~80\ W eco floor;
+Balanced and Gaming allow boost.
+.TP
+.B fan auto
+Hand the fans back to firmware control.
+.TP
+.BI "fan " RPM
+Set a fixed fan RPM (2000\(en4800).
+.TP
+.B fancurve
+Run a temperature-driven automatic fan curve (tracks CPU + dGPU temps).
+.B Ctrl-C
+restores auto.
+.TP
+.B rpm
+Print live fan RPM on a 2-second loop.
+.TP
+.BI "battery " "50-100|off|status"
+Set, disable, or read the EC battery charge limit. The stored percentage cannot
+be read back (the firmware returns only a status byte), so confirm behaviorally \(em
+charging should stop near the limit.
+.TP
+.BI "kbd " "white|red|purple|green|off"
+Set the keyboard backlight to a solid colour preset, or turn it off.
+.TP
+.BI "epp " [0-255]
+Show or set the CPU energy-vs-performance bias (intel_pstate HWP; 0 = max
+performance, 255 = max power-save). Note: TLP resets EPP on every AC/battery
+switch.
+.TP
+.BI "powerd " "on|off|status"
+Toggle NVIDIA Dynamic Boost (\fInvidia-powerd\fR) at runtime. \fBoff\fR lets the
+dGPU reach its near-0\ W deep-sleep state.
+.TP
+.BI "power " "max|save|status"
+\fBmax\fR enables Dynamic Boost (up to ~175\ W); \fBsave\fR disables it; \fBstatus\fR
+reports the current state.
+.TP
+.BI "uv " "mV min " [ max ]
+Apply a dGPU undervolt: shift the voltage/frequency curve left by \fImV\fR for
+clocks above \fImin\fR MHz, optionally capping the clock at \fImax\fR MHz. See
+.B dGPU UNDERVOLT
+below. Requires root.
+.TP
+.B uv reset
+Reset the dGPU to its stock curve and clear the saved undervolt profile.
+.TP
+.B nvtest
+Read-only diagnostic: dump the live VF curve and voltage. Works without root.
+.SH DGPU UNDERVOLT
+The dGPU undervolt shifts the GPU's voltage/frequency curve to run cooler and
+quieter at the same clocks (like MSI Afterburner's curve undervolt). Settings:
+.TP
+.B Undervolt (mV)
+How far to shift the curve left (lower voltage for a given clock). Start small,
+e.g. 30\(en50 mV.
+.TP
+.B Min freq
+Clocks below this stay at stock voltage (keeps idle stable).
+.TP
+.B Max freq
+A hard clock ceiling, like a power slider.
+.PP
+Changing dGPU settings requires
+.BR root .
+Launch the tool with
+.B sudo razerctl
+to edit; a plain
+.B razerctl
+opens the dGPU page read-only (live readout visible, settings locked). The TUI
+opens at Min freq 1695 MHz and Max freq 2400 MHz by default.
+.PP
+.B Warning:
+if the panel is driven by the dGPU (BIOS dGPU-only / MUX mode), an unstable curve
+can crash the display (recoverable). Tune gently \(em apply a modest offset,
+confirm it holds under load, then push further.
+.B Reset
+returns to stock.
+.SH FILES
+.TP
+.I ~/.config/razerctl-uv.conf
+Saved undervolt profile, re-applied at login by the user service
+.IR razerctl-uv.service .
+The max-frequency cap is not auto-restored (it needs root).
+.TP
+.I /etc/udev/rules.d/99-razerctl.rules
+udev uaccess rule granting your user access to the Razer HID device.
+.SH NOTES
+The fan tachometer reading ramps slowly (~40\(en50\ s to settle after a change).
+The EC firmware has final say over fan speed and may override the requested value
+as a thermal safeguard.
+.SH SEE ALSO
+Project page and protocol reference:
+.UR https://github.com/TimandXiyu/blade-cli
+.UE
+.SH AUTHOR
+Xiyu (TimandXiyu). Protocol knowledge derived from rnd-ash/razer-laptop-control.
+.SH LICENSE
+GPL-2.0.

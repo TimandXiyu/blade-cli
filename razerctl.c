@@ -540,7 +540,7 @@ static int tui(int fd,const char*node){
     long long pe=-1,ce=-1; double pts=0,cts=0; int ncpu=(int)sysconf(_SC_NPROCESSORS_ONLN); int mon=1;
     int kbi=0; int powerd_on=powerd_enabled(); int eppi=epp_nearest(get_epp(NULL,0)); int batti=0;
     int page=0, sel=0, dsel=0;                               // page 0=main 1=dGPU undervolt
-    int uv_mv=0, minf=1000, maxf=0, nv_applied=0, nv_started=0; char nverr[80]="";
+    int uv_mv=0, minf=1695, maxf=2400, nv_applied=0, nv_started=0; char nverr[80]="";  // sensible starts (15MHz-aligned): floor 1695, ceiling 2400
     static const int BP[NBATT]={0,60,70,80};
     // Telemetry is cached and refreshed at most once per POLL_S; redraws/keypresses reuse the
     // cache so navigation stays snappy and the delta metrics (W, busy%) keep a steady window.
@@ -606,14 +606,13 @@ static int tui(int fd,const char*node){
                 printf("   LIVE  core \033[1;33m%4dMHz\033[0m  volt \033[1;32m%dmV\033[0m  pwr \033[1;33m%dW\033[0m  temp \033[1;33m%dC\033[0m\033[K\n",
                     core<0?0:core, liveV<0?0:liveV, pw<0?0:pw, gt<0?0:gt);
             } else printf("   \033[1;31m%s\033[0m\033[K\n", nverr[0]?nverr:"NvAPI unavailable");
-            if(root) printf("   \033[1;32m● root\033[0m  \033[1;90mundervolt + max-freq cap both available\033[0m\033[K\n");
-            else     printf("   \033[1;33m● sudo-less\033[0m  \033[1;90mundervolt OK · Max-freq cap needs \033[0m\033[1;33msudo razerctl\033[0m\033[K\n");
+            if(root) printf("   \033[1;32m● editable\033[0m \033[1;90m(root)\033[0m\033[K\n");
+            else     printf("   \033[1;33m● READ-ONLY\033[0m  \033[1;90mrun  \033[0m\033[1;33msudo razerctl\033[0m\033[1;90m  to change settings\033[0m\033[K\n");
             printf("  --------------------------------------------\n");
             printf("   \033[1mUNDERVOLT\033[0m  \033[1;90m↑↓ select  ←→ change  Enter: Apply/Reset\033[0m\n");
             ROWC(0,dsel==0,"Undervolt : \033[1;33m%-3d mV\033[0m  \033[1;90mcurve left-shift\033[0m",uv_mv);
             ROWC(1,dsel==1,"Min freq  : \033[1;33m%-5d MHz\033[0m \033[1;90mstock below\033[0m",minf);
-            ROWC(2,dsel==2,"Max freq  : \033[1;33m%-5s\033[0m %s",maxf?({static char mb[12];snprintf(mb,12,"%dMHz",maxf);mb;}):"off",
-                 root?"\033[1;90mclock ceiling\033[0m":"\033[1;33mclock ceiling — needs sudo\033[0m");
+            ROWC(2,dsel==2,"Max freq  : \033[1;33m%-5s\033[0m \033[1;90mclock ceiling\033[0m",maxf?({static char mb[12];snprintf(mb,12,"%dMHz",maxf);mb;}):"off");
             printf("  - - - - - - - - - - - - - - - - - - - - - - \n");
             ROWC(3,dsel==3,"\033[1;32m[ Apply ]\033[0m  \033[1;90m%d pts, peak +%dMHz\033[0m",cnt,pk);
             ROWC(4,dsel==4,"[ Reset ]  \033[1;90mback to stock curve\033[0m");
@@ -678,10 +677,15 @@ static int tui(int fd,const char*node){
                     else snprintf(msg,sizeof msg,"charge limit OFF (100%%)"); }
             }
         } else {  // dGPU undervolt page
+            // Black-and-white rule: editing the GPU needs root. Sudo-less = read-only
+            // (you can still look at the live readout + navigate, but not change anything).
+            int can_edit=(geteuid()==0);
             if(k==K_ESC){ page=0; last_poll=-1; }
             else if(k=='q'){ if(fanmode==2) set_fan_auto(fd); break; }
             else if(k==K_UP){ dsel=(dsel+DROWS-1)%DROWS; }
             else if(k==K_DOWN){ dsel=(dsel+1)%DROWS; }
+            else if((k==K_ENTER&&dsel==5)){ page=0; last_poll=-1; }   // Back works without root
+            else if(!can_edit){ snprintf(msg,sizeof msg,"read-only — run  sudo razerctl  to change dGPU settings"); }
             else if(k==K_LEFT||k==K_RIGHT){
                 int dir=(k==K_RIGHT)?1:-1;
                 if(dsel==0){ uv_mv+=dir*5; if(uv_mv<0)uv_mv=0; if(uv_mv>150)uv_mv=150; }
@@ -689,20 +693,16 @@ static int tui(int fd,const char*node){
                 else if(dsel==2){ maxf+=dir*15; if(maxf<0)maxf=0; if(maxf>3105)maxf=3105; }
             }
             else if(k==K_ENTER){
-                if(dsel==5){ page=0; last_poll=-1; }
-                else if(!NV.ok) snprintf(msg,sizeof msg,"NvAPI unavailable — cannot apply");
+                if(!NV.ok) snprintf(msg,sizeof msg,"NvAPI unavailable — cannot apply");
                 else if(dsel==3){ int r2=nv_write_uv(uv_mv,minf);
                     if(r2!=0) snprintf(msg,sizeof msg,"curve write FAILED (nvapi %d)",r2);
                     else { nv_applied=1; int pk,c=nv_uv_count(uv_mv,minf,&pk);
-                        int lr = maxf>0 ? nv_lock_max(maxf) : nv_unlock();   // off -> actively release any lock
+                        if(maxf>0) nv_lock_max(maxf); else nv_unlock();
                         uv_save(uv_mv,minf,maxf);
-                        if(maxf>0 && lr!=0)   // SetGpuLockedClocks is root-only; cap_sys_admin isn't enough
-                            snprintf(msg,sizeof msg,"UV applied; max-freq cap NEEDS sudo (nvml %d) - run: sudo razerctl",lr);
-                        else
-                            snprintf(msg,sizeof msg,"APPLIED -%dmV >%dMHz (%d pts,+%dMHz)%s - saved",uv_mv,minf,c,pk,maxf>0?", capped":""); } }
-                else if(dsel==4){ nv_reset(); int ur=nv_unlock();
+                        snprintf(msg,sizeof msg,"APPLIED -%dmV >%dMHz (%d pts,+%dMHz)%s - saved",uv_mv,minf,c,pk,maxf>0?", capped":""); } }
+                else if(dsel==4){ nv_reset(); nv_unlock();
                     nv_applied=0; uv_mv=0; maxf=0; { char p[300]; uv_path(p,sizeof p); unlink(p); }
-                    snprintf(msg,sizeof msg, ur==0?"reset to stock (curve + clocks unlocked)":"curve reset; clock-unlock needs sudo (nvml %d)",ur); }
+                    snprintf(msg,sizeof msg,"reset to stock (curve + clocks unlocked)"); }
             }
         }
     }

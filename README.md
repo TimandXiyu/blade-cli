@@ -131,28 +131,25 @@ run cooler and quieter at the same clocks — like Afterburner's curve undervolt
 - **Max freq** — a hard clock ceiling, like a power slider. `off` = no cap.
 - **Apply** / **Reset** — apply your settings, or return the GPU to stock.
 
-**Sudo matters here.** The page shows a banner telling you which mode you're in:
-
-- 🟢 **root** (`sudo razerctl`) — undervolt **and** max-freq cap both work.
-- 🟡 **sudo-less** (plain `razerctl`) — undervolt works, but the **Max-freq cap
-  needs `sudo`**. The row is tagged accordingly and Apply will tell you if a cap
-  was skipped.
-
-So: **if you want to set a max-frequency cap, launch the tool with
-`sudo razerctl`.** If you only undervolt, plain `razerctl` is fine.
+**You must run it as root to change anything here.** Launch with
+`sudo razerctl`. Plain `razerctl` opens this page **read-only** — you can watch
+the live readout but the settings are locked, and the page says so up top. Simple
+rule: want to touch the GPU, use `sudo razerctl`.
 
 From the command line:
 
 ```sh
-sudo razerctl uv 50 1000 2700   # -50 mV above 1000 MHz, capped at 2700 MHz
-razerctl uv 50 1000             # undervolt only (no cap) — works sudo-less
+sudo razerctl uv 50 1700 2400   # -50 mV above 1700 MHz, capped at 2400 MHz
 sudo razerctl uv reset          # back to stock, clear the saved profile
-razerctl nvtest                 # read-only: dump the live curve + voltage
+razerctl nvtest                 # read-only: dump the live curve + voltage (no sudo)
 ```
 
-**Persistence:** your undervolt is saved and re-applied automatically at login
-(sudo-less). The **max-freq cap is not** auto-restored on reboot, because it needs
-root — re-apply it with `sudo razerctl` each session if you want it.
+**Defaults:** the page opens at **Min freq 1695 MHz** and **Max freq 2400 MHz** so
+you don't have to hold the arrow keys every time — just tweak from there.
+
+**Persistence:** your undervolt is saved and re-applied automatically at login.
+The **max-freq cap is not** auto-restored on reboot (it needs root) — re-apply it
+with `sudo razerctl` each session if you want it.
 
 > ⚠️ If your panel is driven by the dGPU (BIOS dGPU-only / MUX mode), an unstable
 > curve can crash the display (recoverable). Tune gently: apply a modest offset,
@@ -162,32 +159,15 @@ root — re-apply it with `sudo razerctl` each session if you want it.
 
 ## Command-line reference
 
-| Command | What it does |
-|---|---|
-| `razerctl` | launch the TUI dashboard |
-| `razerctl get` | print perf mode + fan setpoint + EPP |
-| `razerctl mode <balanced\|gaming\|creator>` | set performance mode |
-| `razerctl fan auto` | hand the fans back to firmware |
-| `razerctl fan <2000-4800>` | set a fixed fan RPM |
-| `razerctl fancurve` | temperature-driven auto fan (Ctrl-C restores auto) |
-| `razerctl rpm` | live fan RPM, 2 s interval |
-| `razerctl battery <50-100\|off\|status>` | battery charge limit (see note) |
-| `razerctl kbd <white\|red\|purple\|green\|off>` | keyboard backlight |
-| `razerctl epp [0-255]` | show or set CPU energy-vs-performance bias (0 = max perf) |
-| `razerctl powerd <on\|off\|status>` | toggle NVIDIA Dynamic Boost (`nvidia-powerd`) |
-| `razerctl power <max\|save\|status>` | `max` = boost on (≤175 W) · `save` = boost off |
-| `razerctl uv <mV> <min> [max]` | apply a dGPU undervolt (max-freq cap needs sudo) |
-| `razerctl uv reset` | reset the dGPU to stock + clear the saved profile |
-| `razerctl nvtest` | read-only dGPU curve / voltage diagnostic |
+The dashboard is self-explanatory, and every command-line option is documented in
+the man page:
 
-**Notes:**
-- The fan **tachometer ramps slowly** (~40–50 s to settle after a change) — that's
-  the sensor, not a bug.
-- The EC firmware has the final say on fan speed, so you may see it deviate from
-  what you set. That's a built-in safety net; leave it be.
-- Battery limit **can't be read back as a percentage** (the firmware only returns a
-  status byte), so confirm it behaviourally — charging should stop near the limit.
-- `epp` is reset by **TLP** on every AC↔battery switch.
+```sh
+man razerctl
+```
+
+(or `razerctl` with no arguments for the dashboard, or any wrong argument to print
+a quick usage line).
 
 ---
 

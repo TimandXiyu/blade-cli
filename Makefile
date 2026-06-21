@@ -14,12 +14,13 @@ UDEVRULE = /etc/udev/rules.d/99-razerctl.rules
 install: razerctl
 	install -m755 razerctl $(PREFIX)/bin/razerctl
 	setcap cap_sys_admin+epi $(PREFIX)/bin/razerctl
+	install -Dm644 razerctl.1 $(PREFIX)/share/man/man1/razerctl.1
 	printf '%s\n' 'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02b7", MODE="0660", TAG+="uaccess"' > $(UDEVRULE)
 	udevadm control --reload-rules && udevadm trigger || true
-	@echo "installed $(PREFIX)/bin/razerctl + udev rule. Re-plug or re-login if it can't reach the device yet."
+	@echo "installed $(PREFIX)/bin/razerctl + man page + udev rule. Re-plug or re-login if it can't reach the device yet."
 
 uninstall:
-	rm -f $(PREFIX)/bin/razerctl $(UDEVRULE)
+	rm -f $(PREFIX)/bin/razerctl $(PREFIX)/share/man/man1/razerctl.1 $(UDEVRULE)
 	udevadm control --reload-rules || true
 
 clean:

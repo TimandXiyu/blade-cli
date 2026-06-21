@@ -31,6 +31,7 @@ target_link_libraries(razerctl PRIVATE ${CMAKE_DL_LIBS})   # dlopen libnvidia-ap
 # ---- install (optional; run with sudo for the sudo-less setup to take) --------
 include(GNUInstallDirs)
 install(TARGETS razerctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES razerctl.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 
 option(RAZERCTL_SETUP "On install: grant cap_sys_admin + install the udev rule (needs root)" ON)
 if(RAZERCTL_SETUP)
