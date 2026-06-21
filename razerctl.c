@@ -157,8 +157,11 @@ static int reclaim_dgpu(void){
 }
 // ---------- TUI ----------
 static struct termios orig;
+static char obuf[1<<15];
 static void raw_on(){ tcgetattr(0,&orig); struct termios t=orig; t.c_lflag&=~(ICANON|ECHO);
-    t.c_cc[VMIN]=1; t.c_cc[VTIME]=0; tcsetattr(0,TCSANOW,&t); printf("\033[?25l"); }
+    t.c_cc[VMIN]=1; t.c_cc[VTIME]=0; tcsetattr(0,TCSANOW,&t);
+    setvbuf(stdout,obuf,_IOFBF,sizeof obuf);   // whole frame -> one write() (no per-line flush flicker)
+    printf("\033[2J\033[?25l"); }              // one full clear on entry; frames then redraw in place
 static void raw_off(){ tcsetattr(0,TCSANOW,&orig); printf("\033[?25h\033[0m\n"); }
 static void rds(const char*p,char*o,int n){ o[0]=0; FILE*f=fopen(p,"r"); if(!f)return;
     if(fgets(o,n,f)){ int l=strlen(o); if(l&&o[l-1]==0x0a)o[l-1]=0; } fclose(f); }
@@ -478,13 +481,22 @@ static int powerd_enabled(void){ return system("/usr/bin/systemctl is-active --q
 
 // ---- arrow-key input: returns a logical key or a raw char ----
 enum { K_UP=0x100,K_DOWN,K_LEFT,K_RIGHT,K_ENTER,K_ESC };
+// Read ONE more byte of an in-flight escape sequence, waiting up to `us` for it.
+// Uses raw read(0) -- NOT getchar() -- so it shares the same kernel buffer the
+// main loop's select() polls. (Mixing getchar()'s stdio buffer with select() on
+// the raw fd silently dropped arrow keys: getchar() slurped the whole ESC[A into
+// stdio, select() saw an empty kernel buffer, and the arrow decoded as a bare ESC.)
+static int seq_byte(int us){
+    fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={0,us};
+    if(select(1,&r,0,0,&tv)<=0) return -1;
+    unsigned char b; return read(0,&b,1)==1 ? b : -1;
+}
 static int readkey(void){
-    int c=getchar();
-    if(c==27){   // ESC alone, or CSI arrow sequence
-        fd_set r; FD_ZERO(&r); FD_SET(0,&r); struct timeval tv={0,2000};
-        if(select(1,&r,0,0,&tv)<=0) return K_ESC;
-        int a=getchar();
-        if(a=='['){ int b=getchar();
+    unsigned char c; if(read(0,&c,1)!=1) return -1;
+    if(c==27){   // ESC alone, or CSI arrow sequence -- 50ms grace so a terminal that
+        int a=seq_byte(50000);            // splits ESC [ A across reads (SSH) isn't chopped
+        if(a<0) return K_ESC;
+        if(a=='['){ int b=seq_byte(50000);
             if(b=='A')return K_UP; if(b=='B')return K_DOWN;
             if(b=='C')return K_RIGHT; if(b=='D')return K_LEFT; return -1; }
         return K_ESC;
@@ -492,7 +504,7 @@ static int readkey(void){
     if(c=='\r'||c=='\n') return K_ENTER;
     return c;
 }
-#define ROWC(y,is,...) do{ printf("  %s ",(is)?"\033[1;36m▶":" "); printf(__VA_ARGS__); printf("\033[0m\n"); }while(0)
+#define ROWC(y,is,...) do{ printf("  %s ",(is)?"\033[1;36m▶":" "); printf(__VA_ARGS__); printf("\033[0m\033[K\n"); }while(0)
 #define MROWS 10
 #define DROWS 6
 
@@ -535,15 +547,15 @@ static int tui(int fd,const char*node){
         // ---- render ----
         if(page==0){
             char eppname[24]; int epp=get_epp(eppname,sizeof eppname);
-            printf("\033[2J\033[H\033[1;36m  razerctl\033[0m  Blade 16 (1532:02b7)  [%s]\n",node);
+            printf("\033[H\033[1;36m  razerctl\033[0m  Blade 16 (1532:02b7)  [%s]\033[K\n",node);
             printf("  --------------------------------------------\n");
             if(mon){
-                printf("   Fan RPM  \033[1;32m%4d / %4d\033[0m   Batt \033[1;33m%s %.1fW\033[0m%s\n",f1,f2,ac?"AC":"BAT",bw,
+                printf("   Fan RPM  \033[1;32m%4d / %4d\033[0m   Batt \033[1;33m%s %.1fW\033[0m%s\033[K\n",f1,f2,ac?"AC":"BAT",bw,
                     alarm?"  \033[1;31m[ALARM]\033[0m":"");
                 { int gone=(gst[0]==0); int asleep=gone||(strcmp(gst,"suspended")==0);
-                  printf("   dGPU     %s%s\033[0m   CPU \033[1;33m%dC %.0fW\033[0m   busy \033[1;33m%.0f%%\033[0m\n",
+                  printf("   dGPU     %s%s\033[0m   CPU \033[1;33m%dC %.0fW\033[0m   busy \033[1;33m%.0f%%\033[0m\033[K\n",
                       asleep?"\033[1;32m":"\033[1;31m", gone?"absent ~0W":(asleep?"asleep ~0W":"AWAKE"),temp,pkgw,busy); }
-            } else printf("   \033[1;90m-- monitor paused --\033[0m\n");
+            } else printf("   \033[1;90m-- monitor paused --\033[0m\033[K\n");
             printf("  --------------------------------------------\n");
             printf("   \033[1mSETTINGS\033[0m  \033[1;90m↑↓ select  ←→ change\033[0m\n");
             ROWC(0,sel==0,"Perf mode : \033[1;33m%-9s\033[0m %s",modename(pm),pm==2?"GPU eco ~80W":pm==1?"boost ~175W":"boost ~118W");
@@ -564,12 +576,12 @@ static int tui(int fd,const char*node){
             if(!nv_started){ nv_started=1; if(nv_init()!=0) snprintf(nverr,sizeof nverr,"NvAPI init failed (libnvidia-api.so?)"); ml_init(); }
             int liveV=NV.ok?nv_voltage_mv():-1, core=ml_core(), pw=ml_power(), gt=ml_temp();
             int pk=0,cnt=NV.ok?nv_uv_count(uv_mv,minf,&pk):0;
-            printf("\033[2J\033[H\033[1;36m  razerctl · dGPU undervolt\033[0m  [%s]   \033[1;90m◂ Esc: back\033[0m\n",NV.ok?NV.name:"no NvAPI");
+            printf("\033[H\033[1;36m  razerctl · dGPU undervolt\033[0m  [%s]   \033[1;90m◂ Esc: back\033[0m\033[K\n",NV.ok?NV.name:"no NvAPI");
             printf("  --------------------------------------------\n");
             if(NV.ok){
-                printf("   LIVE  core \033[1;33m%4dMHz\033[0m  volt \033[1;32m%dmV\033[0m  pwr \033[1;33m%dW\033[0m  temp \033[1;33m%dC\033[0m\n",
+                printf("   LIVE  core \033[1;33m%4dMHz\033[0m  volt \033[1;32m%dmV\033[0m  pwr \033[1;33m%dW\033[0m  temp \033[1;33m%dC\033[0m\033[K\n",
                     core<0?0:core, liveV<0?0:liveV, pw<0?0:pw, gt<0?0:gt);
-            } else printf("   \033[1;31m%s\033[0m\n", nverr[0]?nverr:"NvAPI unavailable");
+            } else printf("   \033[1;31m%s\033[0m\033[K\n", nverr[0]?nverr:"NvAPI unavailable");
             printf("  --------------------------------------------\n");
             printf("   \033[1mUNDERVOLT\033[0m  \033[1;90m↑↓ select  ←→ change  Enter: Apply/Reset\033[0m\n");
             ROWC(0,dsel==0,"Undervolt : \033[1;33m%-3d mV\033[0m  \033[1;90mcurve left-shift\033[0m",uv_mv);
@@ -579,11 +591,12 @@ static int tui(int fd,const char*node){
             ROWC(3,dsel==3,"\033[1;32m[ Apply ]\033[0m  \033[1;90m%d pts, peak +%dMHz\033[0m",cnt,pk);
             ROWC(4,dsel==4,"[ Reset ]  \033[1;90mback to stock curve\033[0m");
             ROWC(5,dsel==5,"\033[1;36m◂ Back\033[0m      \033[1;90mEnter or Esc\033[0m");
-            printf("   state: %s\033[0m\n", nv_applied?"\033[1;32mAPPLIED":"\033[1;90mnot applied");
+            printf("   state: %s\033[0m\033[K\n", nv_applied?"\033[1;32mAPPLIED":"\033[1;90mnot applied");
             printf("  --------------------------------------------\n");
             printf("   \033[1;90m↑↓ move   ←→ change   Enter apply/reset/back   q quit\033[0m\n");
         }
-        if(msg[0]) printf("\n   \033[32m%s\033[0m\n",msg);
+        if(msg[0]) printf("\n   \033[32m%s\033[0m\033[K\n",msg);
+        printf("\033[J");   // wipe any lines below the frame (page switch / msg cleared)
         fflush(stdout);
 
         // ---- input ----
